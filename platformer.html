@@ -1,0 +1,650 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Platformer — Single File Game</title>
+<style>
+  :root{--bg:#0b1220;--fg:#e7f0ff;--accent:#5ab1ff;--danger:#ff5a5a;}
+  html,body{height:100%;margin:0;font-family:Inter,system-ui,Arial;background:linear-gradient(#081026,#071022 60%);color:var(--fg)}
+  #gameWrap{display:flex;justify-content:center;padding:14px}
+  canvas{background:linear-gradient(#071223,#081629);border:3px solid rgba(255,255,255,.04);box-shadow:0 12px 40px rgba(2,6,20,.6);border-radius:10px}
+  .ui{position:fixed;left:18px;top:18px;color:#dff0ff;z-index:50}
+  .ui .line{margin-bottom:8px;font-weight:700;text-shadow:0 1px 0 rgba(0,0,0,.6)}
+  .centerUI{position:fixed;left:50%;transform:translateX(-50%);top:18px;color:#cfe9ff;z-index:40}
+  .controls{position:fixed;right:18px;bottom:18px;z-index:60;display:flex;gap:8px}
+  .btn{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.06);padding:10px 12px;border-radius:10px;color:var(--fg);font-weight:700;cursor:pointer}
+  .small{font-size:13px;opacity:.9}
+  #touchPanel{display:none;gap:6px}
+  .touchBtn{width:64px;height:64px;border-radius:12px;background:rgba(255,255,255,.04);display:flex;align-items:center;justify-content:center;font-weight:800}
+  @media(max-width:720px){ canvas{width:92vw;height:56vw} #touchPanel{display:flex} .controls{right:12px;bottom:12px} }
+  /* Simple in-game legend */
+  .legend{margin-top:8px;font-size:13px;color:#9fb7d9}
+</style>
+</head>
+<body>
+  <div id="gameWrap">
+    <canvas id="screen" width="960" height="540"></canvas>
+  </div>
+
+  <div class="ui">
+    <div class="line">Score: <span id="score">0</span></div>
+    <div class="line">Lives: <span id="lives">3</span></div>
+    <div class="line">Level: <span id="level">1</span></div>
+    <div class="legend">Arrows / WASD to move • Space or K to jump • P to pause</div>
+  </div>
+
+  <div class="centerUI" id="message" style="display:none"></div>
+
+  <div class="controls">
+    <button class="btn small" id="pauseBtn">Pause (P)</button>
+    <button class="btn small" id="restartBtn">Restart</button>
+
+    <div id="touchPanel">
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <div class="touchBtn" id="upTouch">▲</div>
+        <div style="display:flex;gap:6px">
+          <div class="touchBtn" id="leftTouch">◀</div>
+          <div class="touchBtn" id="rightTouch">▶</div>
+        </div>
+      </div>
+      <div class="touchBtn" id="jumpTouch" style="width:74px">JUMP</div>
+    </div>
+  </div>
+
+<script>
+/* ------------------------------
+   Platformer — single-file game
+   Features: movement, camera,
+   multiple levels, enemies, coins
+   ------------------------------ */
+
+/* ---------- CONFIG ---------- */
+const CONFIG = {
+  tileSize: 48,
+  gravity: 1600,         // pixels/sec^2
+  maxFallSpeed: 1200,
+  moveSpeed: 260,
+  accel: 4200,
+  jumpSpeed: 620,
+  doubleJumpAllowed: true,
+  canvasWidth: 960,
+  canvasHeight: 540,
+  startingLives: 3,
+  coinValue: 10,
+  enemySpeed: 80,
+  cameraLerp: 0.12
+};
+
+/* ---------- LEVELS (tile maps) ----------
+Legend:
+. = empty
+# = solid block
+P = player start
+C = coin
+E = enemy patrol spawn
+K = key
+D = door (locked until key)
+G = goal (level exit)
+----------------------------------------*/
+const LEVELS = [
+`................................................
+................................................
+................................................
+.............C..........................C.......
+................................................
+...........###...........#####..................
+......P..................#...#..................
+##########################...##############...##
+#.............................................G#
+################################################`,
+
+`...........................................................
+.......................C..C.....C...........................
+.............................................................
+.....P....................###..............E.................
+....................##.......................................
+.............#####............................................
+...........##...##.....#######...............#####.............
+#######....#...#......#.....#..............##...##...........G.
+#.....#....#...#......#.....#..............#...#...............
+#.....#....#...#......#.....#..............#...#...............
+###############################################D###############`,
+
+`...............................................................
+..C....C....C..................................................
+...............................................................
+..P...........#######....................#####.................
+.............#.....#....................#...#..................
+.....E.......#.....#....C...............#...#........C.........
+.............#.....#########............#...#.................G.
+.............#.............#............#...#..................
+##############.............###################...........K....#
+#..............................................................#
+###############################################################`
+];
+
+/* ---------- UTIL / HELPERS ---------- */
+function now(){ return performance.now()/1000; }
+function clamp(v,a,b){ return Math.max(a, Math.min(b,v)); }
+
+/* ---------- GAME STATE ---------- */
+let canvas = document.getElementById('screen');
+let ctx = canvas.getContext('2d');
+canvas.width = CONFIG.canvasWidth;
+canvas.height = CONFIG.canvasHeight;
+
+let currentLevelIndex = 0;
+let tileSize = CONFIG.tileSize;
+let camera = {x:0,y:0};
+let keysDown = {};
+let touchState = { left:false, right:false, up:false, jump:false };
+let lastTime = now();
+
+let game = {
+  score: 0,
+  lives: CONFIG.startingLives,
+  paused: false,
+  playing: true // becomes false when showing game over
+};
+
+/* ---------- ENTITIES ---------- */
+class Player {
+  constructor(x,y){
+    this.x = x; this.y = y; this.w = 34; this.h = 44;
+    this.vx = 0; this.vy = 0;
+    this.onGround = false;
+    this.canDoubleJump = CONFIG.doubleJumpAllowed;
+    this.facing = 1; // 1 right, -1 left
+    this.respawn = {x,y};
+    this.hasKey = false;
+    this.invulnerableFor = 0;
+  }
+  bbox(){ return {x:this.x,y:this.y,w:this.w,h:this.h}; }
+  center(){ return {x:this.x+this.w/2,y:this.y+this.h/2}; }
+  hurt(){ if(this.invulnerableFor>0) return; game.lives--; this.invulnerableFor = 1.2; if(game.lives<=0){ showMessage("Game Over — Press Restart", true); game.playing=false; } else { respawnPlayer(); } updateHUD(); }
+}
+
+class Enemy {
+  constructor(x,y,dir=1){ this.x=x; this.y=y; this.w=40; this.h=36; this.vx = CONFIG.enemySpeed*dir; this.patrolDir = dir; this.alive=true; }
+  bbox(){ return {x:this.x,y:this.y,w:this.w,h:this.h}; }
+}
+
+/* ---------- LEVEL CLASS ---------- */
+class Level {
+  constructor(mapString){
+    this.map = mapString.split('\n').map(r=>r);
+    this.h = this.map.length;
+    this.w = this.map[0].length;
+    this.tiles = this.map.map(row => row.split(''));
+    this.coins = [];
+    this.enemies = [];
+    this.player = null;
+    this.goal = null;
+    this.key = null;
+    this.door = null;
+    this.build();
+  }
+  build(){
+    for(let y=0;y<this.h;y++){
+      for(let x=0;x<this.w;x++){
+        const ch = this.tiles[y][x];
+        const px = x*tileSize, py = y*tileSize;
+        if(ch==='P'){ this.player = new Player(px + (tileSize-34)/2, py + (tileSize-44)); this.tiles[y][x]='.'; }
+        if(ch==='C'){ this.coins.push({x:px+tileSize/4,y:py+tileSize/4,w:tileSize/2,h:tileSize/2, taken:false}); this.tiles[y][x]='.'; }
+        if(ch==='E'){ this.enemies.push(new Enemy(px+(tileSize-40)/2, py+(tileSize-36))); this.tiles[y][x]='.'; }
+        if(ch==='G'){ this.goal = {x:px, y:py, w:tileSize, h:tileSize}; this.tiles[y][x]='.'; }
+        if(ch==='K'){ this.key = {x:px+8,y:py+8,w:tileSize-16,h:tileSize-16, taken:false}; this.tiles[y][x]='.'; }
+        if(ch==='D'){ this.door = {x:px,y:py,w:tileSize,h:tileSize, locked:true}; this.tiles[y][x]='.'; }
+      }
+    }
+    if(!this.player){ console.warn('No player in level, placing at 2,2'); this.player = new Player(2*tileSize,2*tileSize); }
+  }
+
+  tileAt(px,py){
+    const tx = Math.floor(px / tileSize), ty = Math.floor(py / tileSize);
+    if(ty<0 || tx<0 || ty>=this.h || tx>=this.w) return '#';
+    return this.tiles[ty][tx];
+  }
+
+  isSolidAt(px,py){
+    const tx = Math.floor(px / tileSize), ty = Math.floor(py / tileSize);
+    if(ty<0 || tx<0 || ty>=this.h || tx>=this.w) return true;
+    return this.tiles[ty][tx] === '#';
+  }
+}
+
+/* ---------- GLOBAL LEVEL ---------- */
+let level = new Level(LEVELS[currentLevelIndex]);
+let player = level.player;
+
+/* ---------- INPUT ---------- */
+addEventListener('keydown', e => { keysDown[e.key] = true; if(e.key === 'p' || e.key === 'P') togglePause(); if(e.key === 'k' || e.key === 'K') attemptJump(); if(e.key === 'r' || e.key === 'R') restartGame(); });
+addEventListener('keyup', e => { delete keysDown[e.key]; });
+document.getElementById('pauseBtn').onclick = togglePause;
+document.getElementById('restartBtn').onclick = restartGame;
+
+/* Touch controls */
+function setTouch(id, on){
+  const el = document.getElementById(id);
+  if(!el) return;
+  el.addEventListener('touchstart', e=>{ e.preventDefault(); touchState[id.replace('Touch','').toLowerCase()]=true; }, {passive:false});
+  el.addEventListener('touchend', e=>{ e.preventDefault(); touchState[id.replace('Touch','').toLowerCase()]=false; }, {passive:false});
+}
+['leftTouch','rightTouch','upTouch','jumpTouch'].forEach(setTouch);
+
+/* ---------- PHYSICS / COLLISION ---------- */
+/* Axis-Aligned Bounding Box collision helper */
+function overlap(a,b){
+  return !(a.x + a.w <= b.x || a.x >= b.x + b.w || a.y + a.h <= b.y || a.y >= b.y + b.h);
+}
+
+/* Move with AABB resolution */
+function moveEntity(entity, dt){
+  // Horizontal movement
+  entity.x += entity.vx * dt;
+  // check horizontal collisions against solid tiles
+  if(entity.vx !== 0){
+    const dir = entity.vx > 0 ? 1 : -1;
+    const probeX = dir > 0 ? entity.x + entity.w : entity.x;
+    // test vertical span
+    for(let y= Math.floor(entity.y / tileSize); y <= Math.floor((entity.y + entity.h - 1) / tileSize); y++){
+      const tx = Math.floor(probeX / tileSize);
+      if(y < 0 || tx < 0 || y >= level.h || tx >= level.w) continue;
+      if(level.tiles[y][tx] === '#'){
+        // snap entity
+        if(dir>0) entity.x = tx*tileSize - entity.w - 0.01;
+        else entity.x = (tx+1)*tileSize + 0.01;
+        entity.vx = 0;
+      }
+    }
+  }
+
+  // Vertical movement
+  entity.y += entity.vy * dt;
+  // clamp falling into solids
+  const dirY = entity.vy > 0 ? 1 : -1;
+  if(entity.vy !== 0){
+    const probeY = dirY > 0 ? entity.y + entity.h : entity.y;
+    for(let x= Math.floor(entity.x / tileSize); x <= Math.floor((entity.x + entity.w - 1) / tileSize); x++){
+      const ty = Math.floor(probeY / tileSize);
+      if(ty < 0 || x < 0 || ty >= level.h || x >= level.w) continue;
+      if(level.tiles[ty][x] === '#'){
+        if(dirY>0){
+          entity.y = ty*tileSize - entity.h - 0.01;
+          entity.vy = 0;
+          if(entity === player) player.onGround = true;
+        } else {
+          entity.y = (ty+1)*tileSize + 0.01;
+          entity.vy = 0;
+        }
+      }
+    }
+  }
+}
+
+/* ---------- GAME LOGIC ---------- */
+function attemptJump(){
+  if(!game.playing || game.paused) return;
+  if(player.onGround){
+    player.vy = -CONFIG.jumpSpeed;
+    player.onGround = false;
+    player.canDoubleJump = CONFIG.doubleJumpAllowed;
+  } else if(player.canDoubleJump){
+    player.vy = -CONFIG.jumpSpeed * 0.92; // slightly less powerful double jump
+    player.canDoubleJump = false;
+  }
+}
+
+function update(dt){
+  if(!game.playing || game.paused) return;
+
+  // input horizontal
+  let desired = 0;
+  if(keysDown['ArrowLeft'] || keysDown['a'] || keysDown['A'] || touchState.left) desired -= 1;
+  if(keysDown['ArrowRight'] || keysDown['d'] || keysDown['D'] || touchState.right) desired += 1;
+
+  // apply acceleration to approach desired velocity
+  const targetVx = desired * CONFIG.moveSpeed;
+  const dv = targetVx - player.vx;
+  const maxAccel = CONFIG.accel * dt;
+  player.vx += clamp(dv, -maxAccel, maxAccel);
+
+  // apply friction when no input and on ground
+  if(desired === 0 && player.onGround){
+    player.vx *= 0.84;
+    if(Math.abs(player.vx) < 6) player.vx = 0;
+  }
+
+  if(desired !== 0) player.facing = desired > 0 ? 1 : -1;
+
+  // gravity
+  player.vy += CONFIG.gravity * dt;
+  player.vy = clamp(player.vy, -CONFIG.maxFallSpeed, CONFIG.maxFallSpeed);
+
+  // jump from keyboard or touch
+  const jumpPressed = keysDown[' '] || keysDown['k'] || keysDown['K'] || touchState.jump || touchState.up;
+  if(jumpPressed && (keysDown['_jumpHandled'] !== true)){
+    // handle keydown once
+    if(keysDown[' '] || keysDown['k'] || keysDown['K']) keysDown['_jumpHandled'] = true;
+    if(touchState.jump || touchState.up) { /* handled on touch events */ }
+    attemptJump();
+  }
+  if(!(keysDown[' '] || keysDown['k'] || keysDown['K'])) keysDown['_jumpHandled'] = false;
+
+  // move player with collision
+  player.onGround = false;
+  moveEntity(player, dt);
+
+  // invulnerability timer
+  if(player.invulnerableFor > 0) player.invulnerableFor = Math.max(0, player.invulnerableFor - dt);
+
+  // coins
+  for(const c of level.coins){
+    if(!c.taken && overlap(player.bbox(), c)){
+      c.taken = true;
+      game.score += CONFIG.coinValue;
+      updateHUD();
+    }
+  }
+
+  // key
+  if(level.key && !level.key.taken && overlap(player.bbox(), level.key)){
+    level.key.taken = true;
+    player.hasKey = true;
+    updateHUD();
+  }
+
+  // door
+  if(level.door && overlap(player.bbox(), level.door)){
+    if(level.door.locked){
+      if(player.hasKey){ level.door.locked = false; player.hasKey = false; showSmallMessage("Door unlocked!"); }
+      else {
+        // block player
+        // simple: push back left if moving right, right if moving left
+        if(player.x + player.w/2 > level.door.x + level.door.w/2) player.x = level.door.x + level.door.w + 0.5;
+        else player.x = level.door.x - player.w - 0.5;
+      }
+    }
+  }
+
+  // enemies
+  for(const e of level.enemies){
+    if(!e.alive) continue;
+    // simple patrol: reverse on collision with tile edges
+    e.vx = e.patrolDir * CONFIG.enemySpeed;
+    // attempt move horizontally; if obstacle, flip direction
+    e.x += e.vx * dt;
+    // check tile ahead
+    const aheadX = e.patrolDir > 0 ? e.x + e.w + 6 : e.x - 6;
+    const aheadY = e.y + e.h + 2;
+    if(level.isSolidAt(aheadX, aheadY)) {
+      // if there's a block below ahead, continue; else flip
+      // but more simply, flip when colliding horizontally
+    }
+    // if colliding with solid horizontally, flip
+    for(let ty=Math.floor(e.y / tileSize); ty <= Math.floor((e.y + e.h -1)/tileSize); ty++){
+      const tx = Math.floor((e.x + (e.patrolDir>0? e.w : 0)) / tileSize);
+      if(tx < 0 || ty < 0 || tx >= level.w || ty >= level.h) continue;
+      if(level.tiles[ty][tx] === '#'){ e.patrolDir *= -1; e.x += e.patrolDir * 8 * dt; break; }
+    }
+
+    // gravity on enemies
+    e.vy = (e.vy || 0) + CONFIG.gravity * dt;
+    if(e.vy > CONFIG.maxFallSpeed) e.vy = CONFIG.maxFallSpeed;
+    e.y += e.vy * dt;
+
+    // collide with ground for enemy simplified
+    // snap to tile if overlapping
+    if(level.isSolidAt(e.x, e.y + e.h) || level.isSolidAt(e.x + e.w - 1, e.y + e.h)){
+      // find nearest tile top
+      const ty = Math.floor((e.y + e.h) / tileSize);
+      e.y = ty*tileSize - e.h - 0.01;
+      e.vy = 0;
+    }
+
+    // collision with player
+    if(overlap(player.bbox(), e.bbox())){
+      // if player falling onto enemy, defeat it
+      const playerBottom = player.y + player.h;
+      if(player.vy > 150 && (playerBottom - e.y) < 28){
+        e.alive = false;
+        player.vy = -CONFIG.jumpSpeed * 0.5; // bounce
+        game.score += 25;
+        updateHUD();
+      } else {
+        player.hurt();
+      }
+    }
+  }
+
+  // goal
+  if(level.goal && overlap(player.bbox(), level.goal)){
+    // advance level
+    showMessage("Level Complete!", false);
+    setTimeout(()=>{ nextLevel(); }, 900);
+  }
+
+  // camera follow (lerp)
+  const targetX = player.x + player.w/2 - canvas.width/2;
+  const targetY = player.y + player.h/2 - canvas.height/2;
+  camera.x += (targetX - camera.x) * CONFIG.cameraLerp;
+  camera.y += (targetY - camera.y) * CONFIG.cameraLerp;
+
+  // clamp camera to world bounds
+  camera.x = clamp(camera.x, 0, Math.max(0, level.w*tileSize - canvas.width));
+  camera.y = clamp(camera.y, 0, Math.max(0, level.h*tileSize - canvas.height));
+}
+
+/* ---------- RENDER ---------- */
+function draw(){
+  // clear
+  ctx.clearRect(0,0,canvas.width, canvas.height);
+
+  // draw background gradient subtle
+  ctx.fillStyle = '#071228';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  // draw tiles
+  const startCol = Math.floor(camera.x / tileSize);
+  const endCol = Math.ceil((camera.x + canvas.width) / tileSize);
+  const startRow = Math.floor(camera.y / tileSize);
+  const endRow = Math.ceil((camera.y + canvas.height) / tileSize);
+
+  for(let y = startRow; y < endRow; y++){
+    if(y < 0 || y >= level.h) continue;
+    for(let x = startCol; x < endCol; x++){
+      if(x < 0 || x >= level.w) continue;
+      const ch = level.tiles[y][x];
+      const sx = x*tileSize - camera.x;
+      const sy = y*tileSize - camera.y;
+      if(ch === '#'){
+        // block
+        ctx.fillStyle = '#17324a';
+        roundRect(ctx, sx+1, sy+1, tileSize-2, tileSize-2, 6, true, false);
+        // highlight ridges
+        ctx.fillStyle = '#254a6f';
+        ctx.fillRect(sx+2, sy+2, tileSize-4, 6);
+      }
+      // door and other static objects are drawn below
+    }
+  }
+
+  // draw coins
+  for(const c of level.coins){
+    if(c.taken) continue;
+    const sx = c.x - camera.x, sy = c.y - camera.y;
+    ctx.save();
+    ctx.translate(sx + c.w/2, sy + c.h/2);
+    // simple shiny coin
+    ctx.beginPath();
+    ctx.ellipse(0,0,c.w/2,c.h/2,0,0,Math.PI*2);
+    ctx.fillStyle = '#ffdf5a';
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#f0b63a';
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // draw key
+  if(level.key && !level.key.taken){
+    ctx.fillStyle = '#f7d86a';
+    const sx = level.key.x - camera.x, sy = level.key.y - camera.y;
+    ctx.fillRect(sx+6, sy+10, level.key.w-12, level.key.h-18);
+    ctx.fillRect(sx+level.key.w/2 - 6, sy+2, 12, 8);
+  }
+
+  // draw door
+  if(level.door){
+    const sx = level.door.x - camera.x, sy = level.door.y - camera.y;
+    ctx.fillStyle = level.door.locked ? '#8a6f3a' : '#6fa36f';
+    roundRect(ctx, sx+1, sy+1, level.door.w-2, level.door.h-2, 4, true, false);
+    if(level.door.locked){
+      ctx.fillStyle = '#40331f';
+      ctx.fillRect(sx + level.door.w/2 - 8, sy + level.door.h/3, 16, 16);
+    }
+  }
+
+  // draw goal
+  if(level.goal){
+    ctx.fillStyle = '#5af7a3';
+    ctx.fillRect(level.goal.x - camera.x + 8, level.goal.y - camera.y + 8, tileSize-16, tileSize-16);
+    ctx.fillStyle = '#103a29';
+    ctx.fillText('GO', level.goal.x - camera.x + tileSize/2 - 8, level.goal.y - camera.y + tileSize/2 + 6);
+  }
+
+  // draw enemies
+  for(const e of level.enemies){
+    if(!e.alive) continue;
+    const sx = e.x - camera.x, sy = e.y - camera.y;
+    ctx.fillStyle = '#ff6a6a';
+    roundRect(ctx, sx, sy, e.w, e.h, 8, true, false);
+    // eyes
+    ctx.fillStyle = '#111';
+    ctx.fillRect(sx + 8, sy + 10, 6, 6);
+    ctx.fillRect(sx + e.w - 14, sy + 10, 6, 6);
+  }
+
+  // draw player
+  const px = player.x - camera.x, py = player.y - camera.y;
+  ctx.save();
+  ctx.globalAlpha = (player.invulnerableFor > 0) ? (0.5 + 0.5 * Math.sin(now()*30)) : 1;
+  // body
+  ctx.fillStyle = '#4fa3ff';
+  roundRect(ctx, px, py, player.w, player.h, 8, true, false);
+  // face / eyes
+  ctx.fillStyle = '#082136';
+  ctx.fillRect(px + (player.facing>0? 20:8), py + 10, 6, 6);
+  ctx.restore();
+
+  // debug: player bbox
+  // ctx.strokeStyle='lime'; ctx.strokeRect(px,py,player.w,player.h);
+}
+
+/* ---------- UI ---------- */
+function updateHUD(){
+  document.getElementById('score').innerText = game.score;
+  document.getElementById('lives').innerText = game.lives;
+  document.getElementById('level').innerText = currentLevelIndex+1;
+}
+
+function showMessage(text, permanent){
+  const el = document.getElementById('message');
+  el.style.display = 'block';
+  el.innerText = text;
+  if(!permanent) setTimeout(()=>{ el.style.display='none'; }, 900);
+}
+function showSmallMessage(t){
+  const old = document.title;
+  document.title = t;
+  setTimeout(()=>document.title = old, 900);
+}
+
+/* ---------- LEVEL CONTROL ---------- */
+function loadLevel(index){
+  currentLevelIndex = clamp(index, 0, LEVELS.length-1);
+  level = new Level(LEVELS[currentLevelIndex]);
+  player = level.player;
+  camera.x = camera.y = 0;
+  game.paused = false;
+  game.playing = true;
+  updateHUD();
+  hideMessage();
+}
+function nextLevel(){
+  if(currentLevelIndex < LEVELS.length - 1){
+    loadLevel(currentLevelIndex + 1);
+    showSmallMessage("Level " + (currentLevelIndex+1));
+  } else {
+    showMessage("You finished all levels! Well done 🎉", true);
+  }
+}
+function respawnPlayer(){
+  player.x = player.respawn.x; player.y = player.respawn.y;
+  player.vx = player.vy = 0;
+  player.invulnerableFor = 1.2;
+}
+function restartGame(){
+  game.score = 0;
+  game.lives = CONFIG.startingLives;
+  loadLevel(0);
+  updateHUD();
+}
+function hideMessage(){ document.getElementById('message').style.display = 'none'; }
+
+/* ---------- GAME LOOP ---------- */
+function loop(){
+  const t = now();
+  const dt = Math.min(0.033, t - lastTime);
+  lastTime = t;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* ---------- INIT ---------- */
+function togglePause(){
+  game.paused = !game.paused;
+  showMessage(game.paused ? "Paused" : "Unpaused", false);
+}
+function init(){
+  // show touch if mobile
+  if(window.innerWidth < 720){
+    document.getElementById('touchPanel').style.display = 'flex';
+  }
+  updateHUD();
+  lastTime = now();
+  loop();
+}
+init();
+
+/* ---------- UTILS ---------- */
+function roundRect(ctx, x, y, w, h, r, fill, stroke){
+  if(typeof r === 'number') r = {tl:r, tr:r, br:r, bl:r};
+  ctx.beginPath();
+  ctx.moveTo(x + r.tl, y);
+  ctx.lineTo(x + w - r.tr, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r.tr);
+  ctx.lineTo(x + w, y + h - r.br);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r.br, y + h);
+  ctx.lineTo(x + r.bl, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r.bl);
+  ctx.lineTo(x, y + r.tl);
+  ctx.quadraticCurveTo(x, y, x + r.tl, y);
+  ctx.closePath();
+  if(fill) ctx.fill();
+  if(stroke){ ctx.strokeStyle = stroke; ctx.stroke(); }
+}
+
+/* ---------- Helpers: show / hide message element ---------- */
+function showMessageElement(text){
+  const el = document.getElementById('message'); el.innerText = text; el.style.display = 'block';
+}
+
+/* Provide clear restart/controls hints in console */
+console.log("Platformer ready. Controls: Arrow keys / WASD to move, Space or K to jump, P to pause, R to restart.");
+
+</script>
+</body>
+</html>
